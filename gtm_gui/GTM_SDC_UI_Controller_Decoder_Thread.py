@@ -18,6 +18,7 @@ from datetime import datetime, timedelta, timezone
 from PyQt5.QtCore import QThread, pyqtSignal
 
 from GTM_SDC_UI_Controller_Decoder_Thread_C import c_decoder
+from GTM_Decoder_Continuous import prepare_decode_inputs
 
 class UiDecoderThread(QThread):
 
@@ -36,6 +37,7 @@ class UiDecoderThread(QThread):
     decoder_thread_plot_slave_sync = pyqtSignal(list)
     decoder_thread_plot_light_curve =  pyqtSignal(list)
     decoder_thread_finish_signal = pyqtSignal()
+    decoder_thread_error_signal = pyqtSignal(str)
 
     def __init__(self, parent):
         
@@ -45,6 +47,9 @@ class UiDecoderThread(QThread):
 
         # Import useful info in MainWindowController, mainly parent.ui
         self.parent = parent
+        self.selected_input_files = list(getattr(parent, 'decoder_cached_input_file_list', []))
+        continuous_checkbox = getattr(parent.ui, 'Continuous_Files_on_checkBox', None)
+        self.continuous_files = bool(continuous_checkbox and continuous_checkbox.isChecked())
 
         # self.gtm_final_df_data = None
         # self.gtm_ref_df = None
@@ -54,37 +59,59 @@ class UiDecoderThread(QThread):
     
     # Make thread happend in QThread!
     def run(self):
-        self.decoder_start()
+        try:
+            self.decoder_start()
+        except Exception as error:
+            print(f'Error: Decoder: {error}')
+            self.decoder_thread_error_signal.emit(str(error))
 
     ### decoder_start ###
 
     def decoder_start(self):
 
+        try:
+            with prepare_decode_inputs(self.selected_input_files, self.continuous_files,
+                                       self.parent.in_space_flag, self.parent.decode_mode) as jobs:
+                self.decode_inputs = {job.output_prefix: job for job in jobs}
+                self.decoder_input_files = [job.output_prefix for job in jobs]
+                self._decoder_start_inputs()
+        finally:
+            self.decoder_thread_finish_signal.emit()
+
+    def _decode_input(self, filename, initial_pointer=0):
+        job = self.decode_inputs[filename]
+        try:
+            if initial_pointer == 0:
+                self.decoder_initailize_output_file(filename)
+            pointer = c_decoder(job.input_path, self.parent.in_space_flag,
+                                self.parent.decode_mode, self.parent.export_mode,
+                                initail_file_pointer=initial_pointer)
+            job.publish_outputs()
+            return pointer
+        except (OSError, RuntimeError, ValueError) as error:
+            message = f'{os.path.basename(filename)}: {error}'
+            print(f'Error: {message}')
+            self.decoder_thread_error_signal.emit(message)
+            return None
+
+    def _decoder_start_inputs(self):
+
         # Get number of input file
-        self.decoder_cached_input_file_number = len(self.parent.decoder_cached_input_file_list)
+        self.decoder_cached_input_file_number = len(self.decoder_input_files)
         
         if (not self.parent.ui.decoder_real_time_display_on_check_box.isChecked()) or \
         self.parent.ui.decoder_science_export_raw_radio_button.isChecked(): # only decode
 
             # Loop all file
-            for decoder_cached_input_file_idx, decoder_cached_input_file in enumerate(self.parent.decoder_cached_input_file_list):
-
-                # Initailize output file
-                self.decoder_initailize_output_file(decoder_cached_input_file)
+            for decoder_cached_input_file_idx, decoder_cached_input_file in enumerate(self.decoder_input_files):
 
                 # Run decoder in c
-                _ = c_decoder(decoder_cached_input_file,
-                              self.parent.in_space_flag,
-                              self.parent.decode_mode, 
-                              self.parent.export_mode, 
-                              initail_file_pointer=0)
+                if self._decode_input(decoder_cached_input_file) is None:
+                    continue
 
                 
                 # Print progress
                 print(f'Finished/Total: {decoder_cached_input_file_idx+1} / {self.decoder_cached_input_file_number}')
-
-                # Emit siganl back to parent class
-                self.decoder_thread_finish_signal.emit()
 
         else: # decode and plot
 
@@ -98,9 +125,6 @@ class UiDecoderThread(QThread):
             # Decode and plot
             self.decoder_plot()
 
-            # Emit siganl back to parent class
-            self.decoder_thread_finish_signal.emit()
-
     def decoder_initailize_output_file(self, filename):
 
         if self.parent.decode_mode == 1: # tmtc
@@ -112,8 +136,8 @@ class UiDecoderThread(QThread):
                 os.remove(f'{filename}_tmtc_slave.csv')
 
         if (self.parent.decode_mode == 2) and ((self.parent.export_mode == 1) or (self.parent.export_mode == 3)): # science raw
-            if os.path.exists(f'{filename}_science_raw.csv'):
-                os.remove(f'{filename}_science_raw.csv')
+            if os.path.exists(f'{filename}_science_raw.txt'):
+                os.remove(f'{filename}_science_raw.txt')
         
         if (self.parent.decode_mode == 2) and ((self.parent.export_mode == 2) or (self.parent.export_mode == 3)): # science pipeline
             if os.path.exists(f'{filename}_science_pipeline.csv'):
@@ -155,35 +179,27 @@ class UiDecoderThread(QThread):
             else: # plot continuously
                 self.decoder_update_time_s = int(self.parent.ui.decoder_update_time_combo_box.currentText())
 
+        requested_update_time_s = self.decoder_update_time_s
         # Loop all file
-        for decoder_cached_input_file_idx, decoder_cached_input_file in enumerate(self.parent.decoder_cached_input_file_list):
+        for decoder_cached_input_file_idx, decoder_cached_input_file in enumerate(self.decoder_input_files):
+            self.decoder_update_time_s = (0 if self.decode_inputs[decoder_cached_input_file].merged
+                                          else requested_update_time_s)
             
             self.filedir_filename_list = [os.path.dirname(decoder_cached_input_file), os.path.basename(decoder_cached_input_file)]
             # Store current file info for this iteration
             self.current_file_dirname = os.path.dirname(decoder_cached_input_file)
             self.current_file_basename = os.path.basename(decoder_cached_input_file)
             
-            # Initailize output file
-            self.decoder_initailize_output_file(decoder_cached_input_file)
-
             # Initialize changing plotting variable
             self.decoder_initailize_plot_df_skip_number()
             
-            if self.parent.ui.decoder_auto_save_figure_group.isEnabled() and \
-            self.parent.ui.decoder_auto_save_figure_on_check_box.isChecked(): # need auto-save figure
-
-                # Emit siganl back to parent class
-                self.decoder_thread_file_signal.emit([self.current_file_dirname, self.current_file_basename])
-
-            else: # just display on screen
-                pass
+            # Titles and exports both use the final (possibly combined) name.
+            self.decoder_thread_file_signal.emit([self.current_file_dirname, self.current_file_basename])
 
             # Run decoder in c
-            new_file_pointer = c_decoder(decoder_cached_input_file,
-                                         self.parent.in_space_flag,
-                                         self.parent.decode_mode, 
-                                         self.parent.export_mode, 
-                                         initail_file_pointer=0)
+            new_file_pointer = self._decode_input(decoder_cached_input_file)
+            if new_file_pointer is None:
+                continue
 
             # Emit siganl back to parent class
             self.decoder_thread_clear_layout_signal.emit()
@@ -211,7 +227,8 @@ class UiDecoderThread(QThread):
                 # Plot science
                 self.decoder_plot_science([f'{decoder_cached_input_file}_science_pipeline.csv'])
 
-            if self.decoder_update_time_s == 0: # only plot one time
+            if self.decoder_update_time_s == 0:
+                # Merged inputs are a fixed snapshot of the selected files.
 
                 # Print progress
                 print(f'Finished/Total: {decoder_cached_input_file_idx+1} / {self.decoder_cached_input_file_number}')
@@ -238,11 +255,9 @@ class UiDecoderThread(QThread):
                     time.sleep(self.decoder_update_time_s)
 
                     # Run decoder in c
-                    new_file_pointer = c_decoder(decoder_cached_input_file,
-                                                 self.parent.in_space_flag,
-                                                 self.parent.decode_mode, 
-                                                 self.parent.export_mode, 
-                                                 initail_file_pointer=new_file_pointer_cached)
+                    new_file_pointer = self._decode_input(decoder_cached_input_file, new_file_pointer_cached)
+                    if new_file_pointer is None:
+                        break
                     
                     # Compare new file pointer
                     if new_file_pointer == new_file_pointer_cached:
@@ -847,6 +862,8 @@ class UiDecoderThread(QThread):
         
     def decoder_plot_science_robotic(self, module, citiroc, channel_row, channel_column, channel_shift, update=False):
 
+        combined_sensor_names = []
+
         # Loop all channel
         for channel_idx, channel in enumerate(list(product(range(channel_row), range(channel_column)))):
 
@@ -1051,11 +1068,14 @@ class UiDecoderThread(QThread):
                         self.decoder_thread_plot_update_science_lg_signal.emit([True, update, module, citiroc, 
                                                                                 channel, channel_idx, channel_shift, sensor_name,
                                                                                 0, lg_line_color, 0, 0, ])
-        # Emit siganl back to parent class
+            if self.parent.ui.combine_Hg_Lg_on_check_box.isChecked() and Sensor_name not in combined_sensor_names:
+                combined_sensor_names.append(Sensor_name)
+
+        # Export every sensor plotted in this CITIROC, after all channels are ready.
         if self.parent.ui.combine_Hg_Lg_on_check_box.isChecked():
-            # print('gg')
-            self.decoder_thread_plot_update_science_hg_lg_combine_signal.emit([False, update, Sensor_name, citiroc, 
-                                                                              self.current_file_dirname, self.current_file_basename])
+            for combined_sensor_name in combined_sensor_names:
+                self.decoder_thread_plot_update_science_hg_lg_combine_signal.emit([False, update, combined_sensor_name, citiroc,
+                                                                                  self.current_file_dirname, self.current_file_basename])
         else:    
             self.decoder_thread_plot_update_science_lg_signal.emit([False, update, module, citiroc])
 

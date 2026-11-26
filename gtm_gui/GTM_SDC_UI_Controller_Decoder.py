@@ -11,6 +11,9 @@ Created on Mon Jun 27 14:58:23 2022
 import os
 import sys
 import numpy as np
+from matplotlib import style
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.figure import Figure
 import sip
 from PyQt5.QtCore import QThread
 from PyQt5.QtWidgets import QFileDialog
@@ -348,6 +351,11 @@ class UiDecoder(object):
 
     def decoder_start(self):
 
+        if getattr(self, 'decoder_thread', None) is not None and self.decoder_thread.isRunning():
+            return
+        self.decoder_errors = []
+        self.ui.decoder_start_button.setEnabled(False)
+
         # Create list to store layout for closing
         self.decoder_plot_open_window_list = []
 
@@ -369,9 +377,20 @@ class UiDecoder(object):
         self.decoder_thread.decoder_thread_plot_slave_sync.connect(self.decoder_plot_sync_data) 
         self.decoder_thread.decoder_thread_plot_light_curve.connect(self.decoder_plot_light_curve) 
         self.decoder_thread.decoder_thread_finish_signal.connect(self.decoder_close_all_figure_refresh)
+        self.decoder_thread.decoder_thread_error_signal.connect(self.decoder_errors.append)
+        self.decoder_thread.finished.connect(self.decoder_finished)
 
         # Start threading
         self.decoder_thread.start()
+
+    def decoder_finished(self):
+        self.ui.decoder_start_button.setEnabled(True)
+        if self.decoder_errors:
+            QtWidgets.QMessageBox.warning(
+                self, 'Decoder',
+                'Decoding completed with errors. Other selected files were still attempted.\n\n'
+                + '\n\n'.join(self.decoder_errors),
+            )
     
     def decoder_plot_open_window_tmtc(self):
 
@@ -383,22 +402,12 @@ class UiDecoder(object):
         # Store layout for closing
         self.decoder_plot_open_window_list.append(self.decoder_plot_tmtc_pg_layout)
 
-        # Create one check window for each selected module
+        # The worker sends selected frames in Master, Slave order.
         self.decoder_plot_tmtc_check_module_list = []
         if self.ui.decoder_display_selection_master_group.isChecked():
             self.decoder_plot_tmtc_check_module_list.append('Master')
         if self.ui.decoder_display_selection_slave_group.isChecked():
             self.decoder_plot_tmtc_check_module_list.append('Slave')
-
-        self.decoder_plot_tmtc_check_layout = {}
-        self.decoder_plot_tmtc_check_line = {}
-        for module in self.decoder_plot_tmtc_check_module_list:
-            layout = pg.GraphicsLayoutWidget(title=f'TMTC Check - {module}')
-            layout.resize(1400, 800)
-            layout.setBackground('w')
-            layout.show()
-            self.decoder_plot_tmtc_check_layout[module] = layout
-            self.decoder_plot_open_window_list.append(layout)
 
     def decoder_plot_open_window_science(self):
         
@@ -738,88 +747,41 @@ class UiDecoder(object):
 
     def decoder_plot_tmtc_check(self, df_list, update=False):
 
-        # Subplot title, CSV columns and legend names (same order as plot_TMTC_try.py)
-        plot_info = [
-            ('Source Sequence Count', ['Source Sequence Count'], ['']),
-            ('Packet Counter', ['Packet Counter'], ['']),
-            ('Lastest PPS Counter', ['Lastest PPS Counter'], ['']),
-            ('Board Temperature', ['Board Temperature#1', 'Board Temperature#2'], ['#1', '#2']),
-            ('Trigger Counter', ['CITIROC1 Trigger Counter', 'CITIROC2 Trigger Counter'], ['CITI1', 'CITI2']),
-            ('Checksum', ['Checksum'], ['']),
-            ('Header', ['Header'], ['']),
-            ('Tail', ['Tail'], [''])
-        ]
+        if not (self.ui.decoder_auto_save_figure_group.isEnabled()
+                and self.ui.decoder_auto_save_figure_on_check_box.isChecked()):
+            return
 
-        for module_idx, module in enumerate(self.decoder_plot_tmtc_check_module_list):
-            df = df_list[module_idx]
-            layout = self.decoder_plot_tmtc_check_layout[module]
+        panels = (
+            ('Packet Counts', 'GTM Packet Number', ('Packet Counter',)),
+            ('PPS Counts', 'GTM PPS Counts', ('Lastest PPS Counter',)),
+            ('Temperature', 'GTM Temperature', ('Board Temperature#1', 'Board Temperature#2')),
+            ('Trigger Rates in 0.1 second', 'GTM Trigger Rates (0.1 sec)',
+             ('CITIROC1 Trigger Counter', 'CITIROC2 Trigger Counter')),
+        )
+        suffix = f'_{self.decoder_update_counter}' if update else ''
+        # Other GUI plots can select a dark style. Use the launch script's defaults locally.
+        with style.context('default'):
+            for module, df in zip(self.decoder_plot_tmtc_check_module_list, df_list):
+                clock = 'GICD' if 'GICD Day' in df.columns else 'ICD'
+                time = (df[f'{clock} Day'] + df[f'{clock} Hour'] / 24
+                        + df[f'{clock} Minute'] / 1440 + df[f'{clock} Second'] / 86400)
 
-            # Space data use GICD time; ground data only have ICD time
-            if 'GICD Day' in df.columns:
-                time_prefix = 'GICD'
-            else:
-                time_prefix = 'ICD'
-            time_data = (df[f'{time_prefix} Day'] + df[f'{time_prefix} Hour'] / 24
-                         + df[f'{time_prefix} Minute'] / 24 / 60
-                         + df[f'{time_prefix} Second'] / 24 / 60 / 60).to_numpy()
+                figure = Figure(figsize=(20, 6), dpi=300, constrained_layout=True)
+                canvas = FigureCanvasAgg(figure)
+                axes = figure.subplots(1, 4)
+                for axis, (title, ylabel, columns) in zip(axes, panels):
+                    for column in columns:
+                        axis.plot(time, df[column], label=column)
+                    axis.set(title=f'GTM-{module[0]} {title}', xlabel='Test Day & time', ylabel=ylabel)
+                    axis.ticklabel_format(axis='x', style='plain', useOffset=False)
+                    axis.minorticks_on()
+                    axis.grid(which='major', alpha=0.5)
+                    axis.grid(which='minor', linestyle=':', alpha=0.3)
+                axes[2].set_ylim(0, 35)
+                axes[3].legend(loc='upper left')
 
-            if not update:
-                self.decoder_plot_tmtc_check_line[module] = {}
-
-            for plot_idx, (title, columns, names) in enumerate(plot_info):
-                if not update:
-                    plot = layout.addPlot(row=plot_idx // 4, col=plot_idx % 4,
-                                          title=title, labels={'bottom': f'{time_prefix} Time [day]'})
-                    plot.setTitle(title, color='k')
-                    for axis in ['left', 'bottom']:
-                        plot.getAxis(axis).setPen('k')
-                        plot.getAxis(axis).setTextPen('k')
-                    # Link to Packet Counter, which also exists in ground data
-                    if plot_idx == 1:
-                        layout.getItem(0, 0).setXLink(plot)
-                    elif plot_idx > 1:
-                        plot.setXLink(layout.getItem(0, 1))
-                    if len(columns) == 2:
-                        plot.addLegend(labelTextColor='k')
-                    if title == 'Board Temperature':
-                        plot.setLabel('left', 'Temperature [°C]')
-                    elif title in ['Header', 'Tail']:
-                        plot.setLabel('left', 'Value [decimal]')
-
-                for column_idx, column in enumerate(columns):
-                    # Ground TMTC does not contain Source Sequence Count
-                    if column not in df.columns:
-                        if not update:
-                            plot.setTitle(f'{title} (not available)', color='k')
-                        continue
-
-                    if column in ['Header', 'Tail']:
-                        # CSV stores Header and Tail as hexadecimal text
-                        values = np.array([int(str(value), 16) for value in df[column]])
-                        color = 'r'
-                    else:
-                        values = df[column].to_numpy()
-                        color = ['#1f77b4', '#ff7f0e'][column_idx]
-
-                    if update:
-                        self.decoder_plot_tmtc_check_line[module][column].setData(time_data, values)
-                    else:
-                        self.decoder_plot_tmtc_check_line[module][column] = plot.plot(
-                            time_data, values, pen=pg.mkPen(color=color, width=2), name=names[column_idx])
-
-            layout.show()
-
-            if self.ui.decoder_auto_save_figure_group.isEnabled() and \
-            self.ui.decoder_auto_save_figure_on_check_box.isChecked(): # need auto-save figure
-                suffix = ''
-                if update:
-                    suffix = f'_{self.decoder_update_counter}'
-                # Draw once to measure tick labels before saving
-                layout.grab()
-                layout.ci.layout.activate()
-                exporter = pg.exporters.ImageExporter(layout.scene())
-                exporter.export(os.path.join(self.decoder_cached_input_file_dirname,
-                                f'{self.decoder_cached_input_file_basename}.decoder_plot_tmtc_check_{module.lower()}{suffix}.png'))
+                filename = f'{self.decoder_cached_input_file_basename}.decoder_plot_tmtc_check_{module.lower()}{suffix}.png'
+                canvas.print_png(os.path.join(self.decoder_cached_input_file_dirname, filename))
 
     # plot light curve
     def decoder_plot_light_curve(self, info_list):
@@ -887,7 +849,7 @@ class UiDecoder(object):
     def decoder_plot_science_robotic(self, info_list):
         
         # Extract file info if provided (for combine mode)
-        if len(info_list) > 12 and info_list[0] == False:  # Display and save mode with file info
+        if len(info_list) >= 6 and info_list[0] == False:  # Display and save mode with file info
             current_file_dirname = info_list[-2]
             current_file_basename = info_list[-1]
         elif len(info_list) > 14 and info_list[0] == True:  # Plot each channel mode with file info

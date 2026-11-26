@@ -953,7 +953,9 @@ int parse_science_event_data(unsigned char *target) {
         return 0;
     } 
     else { // weird 3 bytes
-        fprintf(raw_output_file, "unknow 3 bytes: %1u\n", science_buffer->gtm_id);
+        if (export_mode == 1 || export_mode == 3) {
+            fprintf(raw_output_file, "unknow 3 bytes: %1u\n", science_buffer->gtm_id);
+        }
 
         return 1;
     }
