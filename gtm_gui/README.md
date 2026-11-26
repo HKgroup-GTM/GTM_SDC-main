@@ -98,6 +98,77 @@ python GTM_SDC_Start.py
 
 ## Utility
 
+### Continuous science and TMTC files
+
+In **Decoder**, select the input files and check **Continuous Files > On** before
+pressing **Start**. Matching applies to **In Space / Science** `.vc3` and
+**In Space / TMTC** `.dmp` inputs. Only selected files are inspected; the containing
+folder is never searched. Ground inputs retain individual decoding.
+
+For **Science** VC3 inputs, the decoder checks only
+the selected files, using spacecraft/channel identity, VC frame counters, first
+header pointers, and science packet headers/sequences. It also detects stream
+restarts inside each selected file. A split requires a discontinuous VC counter
+reset to zero, a new FHP alignment at zero, a sequence-zero science packet with a
+valid startup sync record, and at least three consistent frames in the new range.
+Normal 255-to-zero counter wraparound and counter gaps alone do not cause a split.
+Every resulting range is validated before it can be joined to other selected data.
+The decoder orders unambiguous continuations and decodes each group as one input.
+Multiple groups, or a single file containing several streams, can be selected.
+Unsupported, damaged, unmatched, or ambiguous inputs are still attempted
+individually. With the checkbox off, files are decoded individually without splitting.
+
+For **TMTC**, the supported format is the existing decoder's 144-byte APID 145
+packet (6-byte GICD header, 10-byte secondary header, 128-byte ICD data). Matching
+validates packet headers/lengths, master/slave module IDs, ICD tails, the 14-bit
+source sequence count, the 16-bit GTM packet counter, and GICD UTC. Both counters
+must increment with normal wraparound; boundary timestamps must advance at the
+same cadence as the adjacent packets on both sides. Known FS8B-style filenames
+also constrain spacecraft identity and ordering. File timestamps alone are not
+evidence of continuity. A partial packet at a file boundary is joined only when
+its combined bytes validate as a complete packet with the expected counters/time.
+At least two complete packets per initial range are needed to establish cadence.
+
+TMTC can also split a selected file at a confirmed startup: source sequence 1,
+GTM counter 3, unset ICD time, advancing GICD time, and at least three consistent
+packets following the reset. Other gaps or uncertain resets retain individual
+decoding. A normal counter wrap is never treated as a restart. This conservative
+matching can leave valid data separate when the sampling cadence changes at a
+file boundary or the file is too short to confirm continuity.
+
+Each group's output is saved beside its first file in continuity order. Input stems
+are joined without separators, retaining the existing decoder suffix; for example:
+`FS8B_2026285064610FS8B_2026285074611.vc3_science_pipeline.csv`.
+TMTC publishes all three CSVs under the combined `.dmp` prefix, for example
+`FS8B_SPL_2026285064610_145FS8B_SPL_2026285074611_145.dmp_tmtc_all.csv`,
+with corresponding `_tmtc_master.csv` and `_tmtc_slave.csv` files. The seven
+provided Day 285 TMTC inputs form three pairs (020238/030239, 052512/062512,
+064610/074611) and one independent file (011945).
+When a source file is split, its stem receives `_part1`, `_part2`, etc. before the
+stems are joined. For example, selecting the three Day 232 files produces:
+
+- `FS8B_2026232013029FS8B_2026232023029_part1.vc3_science_pipeline.csv`
+- `FS8B_2026232023029_part2FS8B_2026232033030.vc3_science_pipeline.csv`
+
+Raw exports and plot names use the same combined prefix. Original inputs and any
+existing manually merged input files are preserved; only the exact byte ranges are copied
+to temporary inputs, which are removed after processing. Extracted/combined inputs
+are fixed snapshots and are plotted once; original individual files retain the
+existing update/polling behavior. Terminal messages identify each split's byte
+offset (and VC3 frame number), the source ranges, and incomplete trailing packet bytes.
+Those tails remain in the originals; they are not joined across a detected restart
+or decoded as complete packets.
+
+Matching is conservative: unconfirmed resets, missing files, and repeated data
+can prevent a unique match. A chain beginning in the middle of an ICD packet
+still needs the preceding data for the current native decoder to decode it.
+Groups exceeding the native decoder's 1,174,405,120-byte read limit or having
+conflicting/unsupported output names fall back to individual decoding. If staging
+one part fails, all affected groups fall back to the original inputs once each,
+so the same source is not decoded both whole and in part. Native
+decoder failures are isolated from the GUI and reported after other inputs have
+been attempted. Terminal output lists the grouping and any fallback reasons.
+
 ### Flow terminal output
 
 Run the GUI from a terminal to see Flow **Update**, **Clone**, and **Push** reports.
